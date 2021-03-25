@@ -1,89 +1,71 @@
+# coding: utf-8
 
-"""
-Solving FrozenLake environment using Policy-Iteration.
-Adapted by Bolei Zhou for IERG6130. Originally from Moustafa Alzantot (malzantot@ucla.edu)
-"""
-import numpy as np
+__author__ = 'zhenhang.sun@gmail.com'
+__version__ = '1.0.0'
+
 import gym
-from gym import wrappers
-from gym.envs.registration import register
+import math
+import random
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 
 
-def run_episode(env, policy, gamma=1.0, render=False):
-    """ Runs an episode and return the total reward """
-    obs = env.reset()
-    total_reward = 0
-    step_idx = 0
-    while True:
-        if render:
-            env.render()
-        obs, reward, done, _ = env.step(int(policy[obs]))
-        total_reward += (gamma ** step_idx * reward)
-        step_idx += 1
-        if done:
-            break
-    return total_reward
+class Net(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super().__init__()
+        self.linear1 = nn.Linear(input_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        x = F.relu(self.linear1(x))
+        x = self.linear2(x)
+        return x
 
 
-def evaluate_policy(env, policy, gamma=1.0, n=100):
-    scores = [run_episode(env, policy, gamma, False) for _ in range(n)]
-    return np.mean(scores)
+class Agent(object):
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+        self.eval_net = Net(self.state_space_dim, 256, self.action_space_dim)
+        self.optimizer = optim.Adam(self.eval_net.parameters(), lr=self.lr)
+        self.buffer = []
+        self.steps = 0
 
+    def act(self, s0):
+        self.steps += 1
+        epsi = self.epsi_low + (self.epsi_high - self.epsi_low) * (math.exp(-1.0 * self.steps / self.decay))
+        if random.random() < epsi:
+            a0 = random.randrange(self.action_space_dim)
+        else:
+            s0 = torch.tensor(s0, dtype=torch.float).view(1, -1)
+            a0 = torch.argmax(self.eval_net(s0)).item()
+        return a0
 
-def extract_policy(v, gamma=1.0):
-    """ Extract the policy given a value-function """
-    policy = np.zeros(env.env.nS)
-    for s in range(env.env.nS):
-        q_sa = np.zeros(env.env.nA)
-        for a in range(env.env.nA):
-            q_sa[a] = sum([p * (r + gamma * v[s_]) for p, s_, r, _ in env.env.P[s][a]])
-        policy[s] = np.argmax(q_sa)
-    return policy
+    def put(self, *transition):
+        if len(self.buffer) == self.capacity:
+            self.buffer.pop(0)
+        self.buffer.append(transition)
 
+    def learn(self):
+        if (len(self.buffer)) < self.batch_size:
+            return
 
-def compute_policy_v(env, policy, gamma=1.0):
-    """ Iteratively evaluate the value-function under policy.
-    Alternatively, we could formulate a set of linear equations in iterms of v[s]
-    and solve them to find the value function.
-    """
-    v = np.zeros(env.env.nS)
-    eps = 1e-10
-    while True:
-        prev_v = np.copy(v)
-        for s in range(env.env.nS):
-            policy_a = policy[s]
-            v[s] = sum([p * (r + gamma * prev_v[s_]) for p, s_, r, _ in env.env.P[s][policy_a]])
-        if (np.sum((np.fabs(prev_v - v))) <= eps):
-            # value converged
-            break
-    return v
+        samples = random.sample(self.buffer, self.batch_size)
+        s0, a0, r1, s1 = zip(*samples)
+        s0 = torch.tensor(s0, dtype=torch.float)
+        a0 = torch.tensor(a0, dtype=torch.long).view(self.batch_size, -1)
+        r1 = torch.tensor(r1, dtype=torch.float).view(self.batch_size, -1)
+        s1 = torch.tensor(s1, dtype=torch.float)
 
+        y_true = r1 + self.gamma * torch.max(self.eval_net(s1).detach(), dim=1)[0].view(self.batch_size, -1)
+        y_pred = self.eval_net(s0).gather(1, a0)
 
-def policy_iteration(env, gamma=1.0):
-    """ Policy-Iteration algorithm """
-    policy = np.random.choice(env.env.nA, size=(env.env.nS))  # initialize a random policy
-    max_iterations = 200000
-    gamma = 1.0
-    for i in range(max_iterations):
-        old_policy_v = compute_policy_v(env, policy, gamma)
-        new_policy = extract_policy(old_policy_v, gamma)
-        if (np.all(policy == new_policy)):
-            print('Policy-Iteration converged at step %d.' % (i + 1))
-            break
-        policy = new_policy
-    return policy
+        loss_fn = nn.MSELoss()
+        loss = loss_fn(y_pred, y_true)
 
-
-if __name__ == '__main__':
-    env_name = 'FrozenLake-v0'  # 'FrozenLake8x8-v0'
-    env = gym.make(env_name)
-    env.reset()
-    env.render()
-
-    # print(env.env.nA)
-    # print(env.env.nS)
-    #
-    #
-    # optimal_policy = policy_iteration(env, gamma=1.0)
-    # scores = evaluate_policy(env, optimal_policy, gamma=1.0)
-    # print('Average scores = ', np.mean(scores))
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
